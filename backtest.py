@@ -45,7 +45,7 @@ df['MACD'] = ema_12 - ema_26
 df['Volatility'] = df['Close'].pct_change().rolling(10).std()
 df.dropna(inplace=True)
 
-# Target: predict 3-hour forward move > 0.1%
+# Target: predict 3-hour forward move > 0.3%
 future_return = df['Close'].shift(-3) / df['Close'] - 1
 df['Target'] = np.where(future_return > 0.003, 1, 0)
 features = ['SMA_10', 'SMA_50', 'RSI', 'MACD', 'Volatility']
