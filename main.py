@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import pytz
 import asyncio
 from dotenv import load_dotenv
+import json
 
 load_dotenv()
 
@@ -50,6 +51,14 @@ async def update_bot_status():
 async def update_status_loop():
     await update_bot_status()
 
+# load holiday dates
+def load_holidays():
+    try:
+        with open("holidays.json", "r") as file:
+            return set(datetime.datetime.strptime(date, "%Y-%m-%d").date() for date in json.load(file))
+    except FileNotFoundError:
+        return set()
+
 # init account
 def init_account():
     if not os.path.exists(ACCOUNT_FILE):
@@ -82,39 +91,42 @@ def fetch_latest_data():
     rsi_loss = -df['Close'].diff().clip(upper=0).rolling(14).mean()
     df['RSI'] = 100 - 100 / (1 + rsi_gain / rsi_loss)
     df['MACD'] = df['Close'].ewm(span=12).mean() - df['Close'].ewm(span=26).mean()
+    df['Volatility'] = df['Close'].pct_change().rolling(10).std()
     df.dropna(inplace=True)
     return df
 
 # ml detect signal
 def train_model(df):
-    df['Target'] = np.where(df['Close'].shift(-1) > df['Close'], 1, 0)
-    features = ['SMA_10', 'SMA_50', 'RSI', 'MACD']
+    future_return = df['Close'].shift(-3) / df['Close'] - 1
+    df['Target'] = np.where(future_return > 0.003, 1, 0)
+    features = ['SMA_10', 'SMA_50', 'RSI', 'MACD', 'Volatility']
     X = df[features]
     y = df['Target']
     model = GradientBoostingClassifier()
     model.fit(X, y)
-    return model
+    return model, features
 
-def generate_signal(model, latest_row):
-    features = latest_row[['SMA_10', 'SMA_50', 'RSI', 'MACD']].values.reshape(1, -1)
-    return model.predict(features)[0]
+def generate_signal(model, latest_row, features):
+    values = latest_row[features].values.reshape(1, -1)
+    proba = model.predict_proba(values)[0, 1]
+    return int(proba > 0.6), proba
 
 # make trades
-def execute_trade(signal, price):
+def execute_trade(signal, price, confidence):
     acct = load_account()
     cash = acct['cash']
-    shares = int(acct['shares'])
+    shares = acct['shares']
     pending_settlement = acct['pending_settlement']
     settlement_date = acct['settlement_date']
-    action, executed_shares, reason = None, 0, ""
+    action, executed_shares, reason = None, 0.0, ""
 
     if signal == 1 and cash >= price:
-        executed_shares = int(cash // price)
+        executed_shares = round(cash / price, 4)
         if executed_shares > 0:
             cash -= executed_shares * price
             shares += executed_shares
             action = "BUY"
-            reason = "Model predicted price increase."
+            reason = f"Model predicted price increase with {confidence:.2%} confidence."
     elif signal == 0 and shares > 0:
         executed_shares = shares
         proceeds = shares * price
@@ -122,7 +134,7 @@ def execute_trade(signal, price):
         settlement_date = (datetime.datetime.now(TIMEZONE) + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
         shares = 0
         action = "SELL"
-        reason = "Model predicted price drop."
+        reason = f"Model predicted price drop with {confidence:.2%} confidence."
 
     if action:
         save_account(cash, shares, pending_settlement, settlement_date)
@@ -195,38 +207,53 @@ async def graph(ctx):
 async def strat(ctx):
     explanation = (
         "**📊 Strategy Explanation:**\n"
-        "This bot uses **machine learning** to trade SPY every hour on weekdays.\n\n"
-        "**Indicators it uses:**\n"
-        "- **SMA_10 vs SMA_50**: Tracks short vs long-term trend.\n"
-        "- **RSI**: Measures momentum and overbought/oversold status.\n"
-        "- **MACD**: Measures momentum and signal crossovers.\n\n"
-        "**How it works:**\n"
-        "1. Every hour, it pulls the last 15 days of hourly data.\n"
-        "2. It trains a Gradient Boosting model to predict if the next hour will go up.\n"
-        "3. If yes and there's available cash, it buys whole shares.\n"
-        "4. If no and there are shares, it sells all. Proceeds settle next business day.\n"
-        "5. It tracks and separates settled and unsettled cash.\n\n"
-        "Track trades with `!account` or `!graph`."
+        f"This bot uses a machine learning model (Gradient Boosting Classifier) to {TICKER} trade during U.S. market hours.\n\n"
+        "**✅ Trading Rules:**\n"
+        "- **Runs only on weekdays** (Monday–Friday).\n"
+        "- **Avoids U.S. market holidays** listed in `holidays.json`.\n"
+        "- **Only trades between 8:30 AM and 3:00 PM CST.**\n\n"
+        "**📈 Strategy Details:**\n"
+        f"- Pulls last 15 days of hourly {TICKER} data.\n"
+        "- Calculates indicators: SMA_10, SMA_50, RSI, MACD, Volatility.\n"
+        f"- Predicts if {TICKER} will rise over the next 3 hours by >0.3%.\n"
+        "- If confidence > 60%, places a trade using available cash or existing position.\n"
+        "- Trades fractional shares. Sells fully. Settles proceeds next day.\n\n"
+        "Use `!account`, `!graph`, or `!trade` to interact with the bot."
     )
     await ctx.send(explanation)
 
-# trade ml every hour
 @tasks.loop(minutes=1)
 async def scheduled_trade():
     now = datetime.datetime.now(TIMEZONE)
-    if now.weekday() < 5 and now.minute == 0:
+    holidays = load_holidays()
+
+    if now.weekday() >= 5:  # Saturday or Sunday
+        return
+
+    if now.date() in holidays:
+        channel = bot.get_channel(CHANNEL_ID)
+        await channel.send(f"⛔ Market is closed today ({now.date()}) due to a holiday. Skipping trades.")
+        return
+
+    market_open = now.replace(hour=8, minute=30)
+    market_close = now.replace(hour=15, minute=0)
+
+    if now < market_open or now > market_close:
+        return
+
+    if now.minute == 0:
         channel = bot.get_channel(CHANNEL_ID)
         await channel.send(f"🕐 Hourly check at {now.strftime('%I:%M %p')} CST")
         await run_trade(channel)
 
 async def run_trade(channel):
     df = fetch_latest_data()
-    model = train_model(df)
-    signal = generate_signal(model, df.iloc[-1])
+    model, features = train_model(df)
+    signal, confidence = generate_signal(model, df.iloc[-1], features)
     price = df.iloc[-1]['Close']
-    action, shares, price, value, reason = execute_trade(signal, price)
+    action, shares, price, value, reason = execute_trade(signal, price, confidence)
     if action:
-        await channel.send(f"{action} {shares} shares of {TICKER} at ${price:.2f}\nReason: {reason}\nAccount Value: ${value:.2f}")
+        await channel.send(f"{action} {shares:.4f} shares of {TICKER} at ${price:.2f}\nConfidence: {confidence:.2%}\nReason: {reason}\nAccount Value: ${value:.2f}")
     else:
         await channel.send(f"No trade executed. {reason}")
 
