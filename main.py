@@ -11,21 +11,22 @@ import pytz
 import asyncio
 from dotenv import load_dotenv
 import json
+import joblib
 
 load_dotenv()
 
-# config
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 TICKER = "SPY"
 ACCOUNT_FILE = "account.csv"
 TRADE_LOG = "trades.csv"
+MODEL_FILE = "model.pkl"
+DATASET_FILE = "dataset.csv"
 START_BALANCE = 100
 POSITION_SIZE = 1.0
 CHANNEL_ID = 1363325653096726589
 TIMEZONE = pytz.timezone("America/Chicago")
-START_TIME = TIMEZONE.localize(datetime.datetime(2025, 4, 21, 8, 30))
+START_TIME = TIMEZONE.localize(datetime.datetime(2025, 4, 22, 8, 30))
 
-# init discord bot
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -51,7 +52,36 @@ async def update_bot_status():
 async def update_status_loop():
     await update_bot_status()
 
-# load holiday dates
+@tasks.loop(time=datetime.time(hour=15, minute=0, tzinfo=TIMEZONE))
+async def append_daily_data():
+    print("[INFO] Appending daily data...")
+    df_new = fetch_data(period="1d")
+    if os.path.exists(DATASET_FILE):
+        df_old = pd.read_csv(DATASET_FILE, parse_dates=["Datetime"])
+        df_new.reset_index(inplace=True)
+        df = pd.concat([df_old, df_new], ignore_index=True)
+        df.drop_duplicates(subset="Datetime", keep="last", inplace=True)
+        df = df[df["Datetime"] > (datetime.datetime.now() - datetime.timedelta(days=730))]
+    else:
+        df_new.reset_index(inplace=True)
+        df_new = df_new.rename(columns={"index": "Datetime"})
+        df = df_new
+    df.to_csv(DATASET_FILE, index=False)
+    print("[INFO] Daily data appended.")
+
+    print("[INFO] Retraining model...")
+    df = pd.read_csv(DATASET_FILE, parse_dates=["Datetime"])
+    future_return = df['Close'].shift(-3) / df['Close'] - 1
+    df['Target'] = np.where(future_return > 0.003, 1, 0)
+    df.dropna(inplace=True)
+    features = ['SMA_10', 'SMA_50', 'RSI', 'MACD', 'Volatility']
+    X = df[features]
+    y = df['Target']
+    model = GradientBoostingClassifier()
+    model.fit(X, y)
+    joblib.dump((model, features), MODEL_FILE)
+    print("[INFO] Model retrained and saved.")
+
 def load_holidays():
     try:
         with open("holidays.json", "r") as file:
@@ -59,7 +89,6 @@ def load_holidays():
     except FileNotFoundError:
         return set()
 
-# init account
 def init_account():
     if not os.path.exists(ACCOUNT_FILE):
         pd.DataFrame([{
@@ -82,9 +111,8 @@ def save_account(cash, shares, pending_settlement, settlement_date):
         "settlement_date": settlement_date
     }]).to_csv(ACCOUNT_FILE, index=False)
 
-# download latest data
-def fetch_latest_data():
-    df = yf.download(TICKER, period="15d", interval="1h")
+def fetch_data(period="15d"):
+    df = yf.download(TICKER, period=period, interval="1h")
     df['SMA_10'] = df['Close'].rolling(window=10).mean()
     df['SMA_50'] = df['Close'].rolling(window=50).mean()
     rsi_gain = df['Close'].diff().clip(lower=0).rolling(14).mean()
@@ -95,8 +123,10 @@ def fetch_latest_data():
     df.dropna(inplace=True)
     return df
 
-# ml detect signal
-def train_model(df):
+def train_initial_model():
+    df = fetch_data(period="729d")
+    df.reset_index(inplace=True)
+    df.to_csv(DATASET_FILE, index=False)
     future_return = df['Close'].shift(-3) / df['Close'] - 1
     df['Target'] = np.where(future_return > 0.003, 1, 0)
     features = ['SMA_10', 'SMA_50', 'RSI', 'MACD', 'Volatility']
@@ -104,14 +134,19 @@ def train_model(df):
     y = df['Target']
     model = GradientBoostingClassifier()
     model.fit(X, y)
+    joblib.dump((model, features), MODEL_FILE)
     return model, features
+
+def load_model():
+    if os.path.exists(MODEL_FILE):
+        return joblib.load(MODEL_FILE)
+    return train_initial_model()
 
 def generate_signal(model, latest_row, features):
     values = latest_row[features].values.reshape(1, -1)
     proba = model.predict_proba(values)[0, 1]
     return int(proba > 0.6), proba
 
-# make trades
 def execute_trade(signal, price, confidence):
     acct = load_account()
     cash = acct['cash']
@@ -148,7 +183,6 @@ def execute_trade(signal, price, confidence):
         return action, executed_shares, price, cash + shares * price + pending_settlement, reason
     return None, 0, price, cash + shares * price + pending_settlement, "Model did not predict a buy or sell opportunity."
 
-# check if settlement
 @tasks.loop(minutes=1)
 async def check_settlement():
     now = datetime.datetime.now(TIMEZONE)
@@ -160,7 +194,6 @@ async def check_settlement():
             channel = bot.get_channel(CHANNEL_ID)
             await channel.send(f"💰 ${acct['pending_settlement']:.2f} settled and moved to available cash.")
 
-# discord commands
 @bot.command()
 async def account(ctx):
     acct = load_account()
@@ -176,7 +209,15 @@ async def account(ctx):
 @bot.command()
 async def trade(ctx):
     await ctx.send("Checking for signal...")
-    await run_trade(ctx.channel)
+    df = fetch_data()
+    model, features = load_model()
+    signal, confidence = generate_signal(model, df.iloc[-1], features)
+    price = df.iloc[-1]['Close']
+    action, shares, price, value, reason = execute_trade(signal, price, confidence)
+    if action:
+        await ctx.send(f"{action} {shares:.4f} shares of {TICKER} at ${price:.2f}\nConfidence: {confidence:.2%}\nReason: {reason}\nAccount Value: ${value:.2f}")
+    else:
+        await ctx.send(f"No trade executed. {reason}")
 
 @bot.command()
 async def graph(ctx):
@@ -227,7 +268,7 @@ async def scheduled_trade():
     now = datetime.datetime.now(TIMEZONE)
     holidays = load_holidays()
 
-    if now.weekday() >= 5:  # Saturday or Sunday
+    if now.weekday() >= 5:
         return
 
     if now.date() in holidays:
@@ -241,14 +282,14 @@ async def scheduled_trade():
     if now < market_open or now > market_close:
         return
 
-    if now.minute == 0:
+    if now.minute == 31:
         channel = bot.get_channel(CHANNEL_ID)
         await channel.send(f"🕐 Hourly check at {now.strftime('%I:%M %p')} CST")
         await run_trade(channel)
 
 async def run_trade(channel):
-    df = fetch_latest_data()
-    model, features = train_model(df)
+    df = fetch_data()
+    model, features = load_model()
     signal, confidence = generate_signal(model, df.iloc[-1], features)
     price = df.iloc[-1]['Close']
     action, shares, price, value, reason = execute_trade(signal, price, confidence)
@@ -257,10 +298,86 @@ async def run_trade(channel):
     else:
         await channel.send(f"No trade executed. {reason}")
 
-# start bot
+@bot.command()
+async def test(ctx):
+    try:
+        df = pd.read_csv(DATASET_FILE)
+
+        for col in ['Close', 'SMA_10', 'SMA_50', 'RSI', 'MACD', 'Volatility']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df.dropna(subset=['Close'], inplace=True)
+
+        if 'Target' not in df.columns:
+            df['FutureReturn'] = df['Close'].shift(-3) / df['Close'] - 1
+            df['Target'] = np.where(df['FutureReturn'] > 0.003, 1, 0)
+            df.drop(columns=['FutureReturn'], inplace=True)
+            df.dropna(inplace=True)
+
+        model, features = load_model()
+        latest_df = fetch_data()
+        latest_row = latest_df.iloc[-1]
+        values = latest_row[features].astype(float).values.reshape(1, -1)
+        proba = model.predict_proba(values)[0, 1]
+        if proba > 0.6:
+            prediction = "UP 📈"
+            confidence = proba
+        else:
+            prediction = "DOWN 📉"
+            confidence = 1 - proba
+
+        expected_up_means = df[df['Target'] == 1][features].mean()
+        expected_up_std = df[df['Target'] == 1][features].std()
+
+        indicators = []
+        for feat in features:
+            current = latest_row[feat].item()
+            expected = expected_up_means[feat]
+            std = expected_up_std[feat]
+
+            if std == 0 or np.isnan(std):
+                deviation = 0
+            else:
+                deviation = abs(current - expected) / std
+
+            if deviation < 0.5:
+                emoji = "✅"
+                arrow = "⬆️"
+            elif deviation < 1.0:
+                emoji = "⚠️"
+                arrow = "↔"
+            else:
+                emoji = "❌"
+                arrow = "⬇️"
+
+            indicators.append(
+                f"{emoji} **{feat}**: {current:.4f} | expected: {expected:.4f} {arrow}"
+            )
+
+        prediction_vals = (
+            f"Class 0 (↓): {1 - proba:.2%}\n"
+            f"Class 1 (↑): {proba:.2%}"
+        )
+
+        await ctx.send(
+            f"**🔎 Current vs Expected Indicators:**\n" +
+            "\n".join(indicators) +
+            f"\n\n**📊 Model Prediction Probabilities:**\n{prediction_vals}\n\n" +
+            f"**🧠 Final Signal:** **{prediction}** (Confidence: {confidence:.2%})"
+        )
+
+    except Exception as e:
+        await ctx.send(f"❌ Error in !test: {e}")
+
 @bot.event
 async def on_ready():
     init_account()
+    print("[INFO] Bot is initializing model...")
+    if not os.path.exists(MODEL_FILE):
+        print("[INFO] Training initial model...")
+        train_initial_model()
+    else:
+        print("[INFO] Model found. Skipping training.")
+
     channel = bot.get_channel(CHANNEL_ID)
     await channel.send("✅ ML bot is successfully online.")
     if not scheduled_trade.is_running():
@@ -269,6 +386,8 @@ async def on_ready():
         check_settlement.start()
     if not update_status_loop.is_running():
         update_status_loop.start()
+    if not append_daily_data.is_running():
+        append_daily_data.start()
 
 async def main():
     await bot.start(DISCORD_TOKEN)
