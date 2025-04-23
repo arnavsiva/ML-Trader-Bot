@@ -18,11 +18,12 @@ import shap
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-TICKER = "AMD"
+TICKER = "META"
 ACCOUNT_FILE = "account.csv"
 TRADE_LOG = "trades.csv"
 MODEL_FILE = "model.pkl"
 DATASET_FILE = "dataset.csv"
+SETTLEMENT_FILE = "settlement.csv"
 START_BALANCE = 100
 POSITION_SIZE = 1.0
 CHANNEL_ID = 1363325653096726589
@@ -34,21 +35,21 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 async def update_bot_status():
-    trades = pd.read_csv(TRADE_LOG)
     acct = load_account()
-    if trades.empty:
-        trade_count = 0
-        pnl = 0.0
-    else:
-        trades['cash_value'] = trades.apply(
-            lambda row: row['shares'] * row['price'] if row['action'] == 'SELL' else -row['shares'] * row['price'],
-            axis=1
-        )
-        trade_count = len(trades)
-        pnl = trades['cash_value'].sum()
+    last_price = yf.Ticker(TICKER).history(period="1d")['Close'].iloc[-1]
 
+    pending_settlement = 0.0
+    if os.path.exists(SETTLEMENT_FILE):
+        df = pd.read_csv(SETTLEMENT_FILE, parse_dates=["date"])
+        pending_settlement = df["amount"].sum()
+
+    total_value = acct['cash'] + acct['shares'] * last_price + pending_settlement
+
+    trades = pd.read_csv(TRADE_LOG)
+    trade_count = len(trades) if not trades.empty else 0
     days_running = (datetime.datetime.now(TIMEZONE) - START_TIME).days
-    status_msg = f"📈 Watching {TICKER} | {days_running}d | {trade_count} trades | Net ${pnl:.2f}"
+
+    status_msg = f"📈 {TICKER} | {days_running}d | {trade_count} trades | ${total_value:.2f}"
     await bot.change_presence(activity=discord.Game(name=status_msg))
 
 @tasks.loop(minutes=60)
@@ -64,6 +65,17 @@ async def log_to_channel(message: str):
 @tasks.loop(time=datetime.time(hour=15, minute=0, tzinfo=TIMEZONE))
 async def append_daily_data():
     await log_to_channel("Appending daily data...")
+    now = datetime.datetime.now(TIMEZONE)
+    embed = discord.Embed(
+        title="🕒 Appending daily data",
+        description=f"⏰ It is 3:00. Market's are closed and the dataset is appending daily data.",
+        color=0x00ff99
+    )
+    embed.timestamp = now
+    
+    channel = bot.get_channel(CHANNEL_ID)
+    await channel.send(embed=embed)
+    
     df_new = fetch_data(period="1d")
     
     if os.path.exists(DATASET_FILE):
@@ -108,22 +120,26 @@ def init_account():
     if not os.path.exists(ACCOUNT_FILE):
         pd.DataFrame([{
             "cash": START_BALANCE,
-            "shares": 0,
-            "pending_settlement": 0.0,
-            "settlement_date": None
+            "shares": 0
         }]).to_csv(ACCOUNT_FILE, index=False)
+
     if not os.path.exists(TRADE_LOG):
         pd.DataFrame(columns=["timestamp", "action", "price", "shares", "reason"]).to_csv(TRADE_LOG, index=False)
 
-def load_account():
-    return pd.read_csv(ACCOUNT_FILE).iloc[0]
+    if not os.path.exists(SETTLEMENT_FILE):
+        pd.DataFrame(columns=["date", "amount"]).to_csv(SETTLEMENT_FILE, index=False)
 
-def save_account(cash, shares, pending_settlement, settlement_date):
+def load_account():
+    acct = pd.read_csv(ACCOUNT_FILE).iloc[0]
+    return {
+        "cash": float(acct["cash"]),
+        "shares": float(acct["shares"])
+    }
+
+def save_account(cash, shares):
     pd.DataFrame([{
         "cash": cash,
-        "shares": shares,
-        "pending_settlement": pending_settlement,
-        "settlement_date": settlement_date
+        "shares": shares
     }]).to_csv(ACCOUNT_FILE, index=False)
 
 def fetch_data(period="15d"):
@@ -203,10 +219,10 @@ async def train_initial_model():
     joblib.dump((model, features), MODEL_FILE)
     return model, features
 
-def load_model():
+async def load_model():
     if os.path.exists(MODEL_FILE):
         return joblib.load(MODEL_FILE)
-    return train_initial_model()
+    return await train_initial_model()
 
 def generate_signal(model, latest_row, features):
     values = latest_row[features].values.reshape(1, -1)
@@ -217,30 +233,28 @@ def execute_trade(signal, price, confidence):
     acct = load_account()
     cash = acct['cash']
     shares = acct['shares']
-    pending_settlement = acct['pending_settlement']
-    settlement_date = acct['settlement_date']
     action, executed_shares, reason = None, 0.0, ""
 
-    if signal == 1 and cash > 0:
-        executed_shares = round(cash / price, 4)
+    if signal == 1 and (cash - 5) > 0:
+        executed_shares = round((cash - 5) / price, 4)
         if executed_shares > 0:
             cash -= executed_shares * price
             shares += executed_shares
             action = "BUY"
-            reason = f"Model predicted price increase with {confidence:.2%} confidence."
+            reason = f"Model predicted price increase in the next 3 hours with {confidence:.2%} confidence."
         if executed_shares < 0.0001:
-            return None, 0, price, cash + shares * price + pending_settlement, "Not enough cash to buy meaningful shares."
+            return None, 0, price, (cash-5) + shares * price, "Not enough cash to buy meaningful shares."
+
     elif signal == 0 and shares > 0:
         executed_shares = shares
         proceeds = shares * price
-        pending_settlement += proceeds
-        settlement_date = (datetime.datetime.now(TIMEZONE) + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        log_settlement(proceeds)
         shares = 0
         action = "SELL"
-        reason = f"Model predicted price drop with {confidence:.2%} confidence."
+        reason = f"Model predicted price drop in the next 3 hours with {confidence:.2%} confidence."
 
     if action:
-        save_account(cash, shares, pending_settlement, settlement_date)
+        save_account(cash, shares)
         pd.DataFrame([{
             "timestamp": datetime.datetime.now(),
             "action": action,
@@ -248,40 +262,78 @@ def execute_trade(signal, price, confidence):
             "shares": executed_shares,
             "reason": reason
         }]).to_csv(TRADE_LOG, mode='a', header=False, index=False)
-        return action, executed_shares, price, cash + shares * price + pending_settlement, reason
-    return None, 0, price, cash + shares * price + pending_settlement, "Model did not predict a buy or sell opportunity."
+        pending_settlement = 0.0
+        if os.path.exists(SETTLEMENT_FILE):
+            df = pd.read_csv(SETTLEMENT_FILE, parse_dates=["date"])
+            pending_settlement = df["amount"].sum()
+
+        account_value = cash + shares * price + pending_settlement
+        return action, executed_shares, price, account_value, reason
+    return None, 0, price, account_value, "Model did not predict a buy signal or sell opportunity."
 
 @tasks.loop(time=datetime.time(hour=8, minute=0, tzinfo=TIMEZONE))
 async def check_settlement():
     now = datetime.datetime.now(TIMEZONE)
-    acct = load_account()
-    if acct['settlement_date'] and acct['settlement_date'] <= now.strftime("%Y-%m-%d"):
-        new_cash = acct['cash'] + acct['pending_settlement']
-        save_account(new_cash, acct['shares'], 0.0, None)
-        
-        embed = discord.Embed(
-            title="💰 Settlement Complete",
-            description=f"${acct['pending_settlement']:.2f} has been settled and moved to available cash.",
-            color=0x00ff99
-        )
-        embed.timestamp = now
-        
-        channel = bot.get_channel(CHANNEL_ID)
-        await channel.send(embed=embed)
+    today = now.date()
+    yesterday = today - datetime.timedelta(days=1)
+
+    if os.path.exists(SETTLEMENT_FILE):
+        df = pd.read_csv(SETTLEMENT_FILE, parse_dates=["date"])
+        df_to_settle = df[df["date"].dt.date == yesterday]
+
+        if not df_to_settle.empty:
+            total_settlement = df_to_settle["amount"].sum()
+            acct = load_account()
+            new_cash = acct["cash"] + total_settlement
+
+            save_account(new_cash, acct["shares"])
+
+            df = df[df["date"].dt.date != yesterday]
+            df.to_csv(SETTLEMENT_FILE, index=False)
+
+            embed = discord.Embed(
+                title="💰 Settlement Complete",
+                description=f"${total_settlement:.2f} has been settled and added to available cash.",
+                color=0x00ff99
+            )
+            embed.timestamp = now
+
+            channel = bot.get_channel(CHANNEL_ID)
+            await channel.send(embed=embed)
+
+def log_settlement(amount):
+    now = datetime.datetime.now(TIMEZONE)
+    new_entry = pd.DataFrame([{"date": now, "amount": amount}])
+
+    if os.path.exists(SETTLEMENT_FILE):
+        df = pd.read_csv(SETTLEMENT_FILE, parse_dates=["date"])
+        df = df.dropna(how='all')
+        df = df.loc[:, df.columns.intersection(["date", "amount"])]
+    else:
+        df = pd.DataFrame(columns=["date", "amount"])
+
+    df = pd.concat([df, new_entry], ignore_index=True)
+    df.to_csv(SETTLEMENT_FILE, index=False)
 
 @bot.command()
 async def account(ctx):
     acct = load_account()
     last_price = yf.Ticker(TICKER).history(period="1d")['Close'].iloc[-1]
-    total_value = acct['cash'] + acct['shares'] * last_price + acct['pending_settlement']
+    pending_settlement = 0.0
+
+    if os.path.exists(SETTLEMENT_FILE):
+        df = pd.read_csv(SETTLEMENT_FILE, parse_dates=["date"])
+        pending_settlement = df["amount"].sum()
+
+    total_value = acct['cash'] + acct['shares'] * last_price + pending_settlement
 
     embed = discord.Embed(
         title="📊 Account Summary",
         color=0x3498db
     )
     embed.add_field(name="Available Cash", value=f"${acct['cash']:.2f}", inline=False)
-    embed.add_field(name="Pending Settlement", value=f"${acct['pending_settlement']:.2f}", inline=False)
-    embed.add_field(name="Shares", value=f"{int(acct['shares'])}", inline=False)
+    embed.add_field(name="Pending Settlement", value=f"${pending_settlement:.2f}", inline=False)
+    embed.add_field(name="Shares", value=f"{acct['shares']:.4f}", inline=False)
     embed.add_field(name="Total Account Value", value=f"${total_value:.2f}", inline=False)
     embed.timestamp = ctx.message.created_at
 
@@ -289,40 +341,50 @@ async def account(ctx):
 
 @bot.command()
 async def trade(ctx):
-    embed_checking = discord.Embed(
-        title="🔍 Trade Check",
-        description="Checking for signal...",
-        color=0xffc107
-    )
-    await ctx.send(embed=embed_checking)
-
-    df = fetch_data()
-    model, features = load_model()
-    signal, confidence = generate_signal(model, df.iloc[-1], features)
-    price = df.iloc[-1]['Close']
-    action, shares, price, value, reason = execute_trade(signal, price, confidence)
-
-    if action:
-        embed_result = discord.Embed(
-            title="✅ Trade Executed",
-            color=0x2ecc71
+    try:
+        embed_checking = discord.Embed(
+            title="🔍 Trade Check",
+            description="Checking for signal...",
+            color=0xffc107
         )
-        embed_result.add_field(name="Action", value=action, inline=True)
-        embed_result.add_field(name="Shares", value=f"{shares:.4f}", inline=True)
-        embed_result.add_field(name="Price", value=f"${price:.2f}", inline=True)
-        embed_result.add_field(name="Confidence", value=f"{confidence:.2%}", inline=False)
-        embed_result.add_field(name="Reason", value=reason, inline=False)
-        embed_result.add_field(name="Account Value", value=f"${value:.2f}", inline=False)
-    else:
-        embed_result = discord.Embed(
-            title="❌ No Trade Executed",
-            description=reason,
-            color=0xe74c3c
+        await ctx.send(embed=embed_checking)
+
+        df = fetch_data()
+        model, features = await load_model()
+        signal, confidence = generate_signal(model, df.iloc[-1], features)
+        price = yf.Ticker(TICKER).fast_info['last_price']
+        action, shares, price, value, reason = execute_trade(signal, price, confidence)
+
+        if action:
+            embed_result = discord.Embed(
+                title="✅ Trade Executed",
+                color=0x2ecc71
+            )
+            embed_result.add_field(name="Action", value=action, inline=True)
+            embed_result.add_field(name="Shares", value=f"{shares:.4f}", inline=True)
+            embed_result.add_field(name="Price", value=f"${price:.2f}", inline=True)
+            embed_result.add_field(name="Confidence", value=f"{confidence:.2%}", inline=False)
+            embed_result.add_field(name="Reason", value=reason, inline=False)
+            embed_result.add_field(name="Account Value", value=f"${value:.2f}", inline=False)
+        else:
+            embed_result = discord.Embed(
+                title="❌ No Trade Executed",
+                description=reason,
+                color=0xe74c3c
+            )
+
+        embed_result.timestamp = ctx.message.created_at
+        await ctx.send(embed=embed_result)
+
+    except Exception as e:
+        error_msg = f"[ERROR] Exception in !trade: {e}"
+        await log_to_channel(error_msg)
+        embed_error = discord.Embed(
+            title="❌ Trade Error",
+            description=error_msg,
+            color=0xff0000
         )
-
-    embed_result.timestamp = ctx.message.created_at
-
-    await ctx.send(embed=embed_result)
+        await ctx.send(embed=embed_error)
 
 @bot.command()
 async def graph(ctx):
@@ -453,7 +515,7 @@ async def scheduled_trade():
 
 async def run_trade(channel):
     df = fetch_data()
-    model, features = load_model()
+    model, features = await load_model()
     signal, confidence = generate_signal(model, df.iloc[-1], features)
     price = df.iloc[-1]['Close']
     action, shares, price, value, reason = execute_trade(signal, price, confidence)
@@ -497,7 +559,7 @@ async def test(ctx):
             df.drop(columns=['FutureReturn'], inplace=True)
             df.dropna(inplace=True)
 
-        model, features = load_model()
+        model, features = await load_model()
         latest_df = fetch_data()
         latest_row = latest_df.iloc[-1]
         values = latest_row[features].astype(float).values.reshape(1, -1)
@@ -560,7 +622,7 @@ async def test(ctx):
 @bot.command()
 async def why(ctx):
     try:
-        model, features = load_model()
+        model, features = await load_model()
         df = pd.read_csv(DATASET_FILE)
         df = df[features]
 
@@ -631,22 +693,41 @@ async def on_ready():
         await log_to_channel("[INFO] Training initial model...")
         model, features = await train_initial_model()
     else:
-        model, features = load_model()
+        model, features = await load_model()
         await log_to_channel("[INFO] Model found. Skipping training.")
 
     importances = model.feature_importances_
     ranked = sorted(zip(features, importances), key=lambda x: x[1], reverse=True)
     importance_summary = "\n".join([f"**{feat}**: {imp:.3f}" for feat, imp in ranked])
 
+    acct = load_account()
+    last_price = yf.Ticker(TICKER).history(period="1d")['Close'].iloc[-1]
+    pending_settlement = 0.0
+    if os.path.exists(SETTLEMENT_FILE):
+        df = pd.read_csv(SETTLEMENT_FILE, parse_dates=["date"])
+        pending_settlement = df["amount"].sum()
+    total_value = acct['cash'] + acct['shares'] * last_price + pending_settlement
+
+    trades = pd.read_csv(TRADE_LOG)
+    trade_count = len(trades) if not trades.empty else 0
+    days_running = (datetime.datetime.now(TIMEZONE) - START_TIME).days
+
     channel = bot.get_channel(CHANNEL_ID)
     embed = discord.Embed(
-        title="✅ Bot Online",
+        title=f"✅ {TICKER} Bot Online",
         description="The ML trading bot is now live and operational.",
         color=0x2ecc71
     )
     embed.add_field(name="Model Status", value="✅ Loaded" if os.path.exists(MODEL_FILE) else "🧠 Trained", inline=True)
     embed.add_field(name="Tasks", value="Scheduled tasks started successfully.", inline=True)
     embed.add_field(name="📊 Feature Importance", value=importance_summary, inline=False)
+    embed.add_field(
+        name="📈 Bot Stats",
+        value=f"- Days Running: **{days_running}**\n"
+              f"- Trades Executed: **{trade_count}**\n"
+              f"- Account Value: **${total_value:.2f}**",
+        inline=False
+    )
     embed.timestamp = datetime.datetime.now(TIMEZONE)
 
     await channel.send(embed=embed)
