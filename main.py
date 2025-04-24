@@ -14,11 +14,13 @@ import json
 import joblib
 from io import BytesIO
 import shap
+import shutil
+import psutil
 
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-TICKER = "META"
+TICKER = "" # add your ticker
 ACCOUNT_FILE = "account.csv"
 TRADE_LOG = "trades.csv"
 MODEL_FILE = "model.pkl"
@@ -26,10 +28,10 @@ DATASET_FILE = "dataset.csv"
 SETTLEMENT_FILE = "settlement.csv"
 START_BALANCE = 100
 POSITION_SIZE = 1.0
-CHANNEL_ID = 1363325653096726589
-LOGS_CHANNEL_ID = 1364359731908579399
+CHANNEL_ID = 0 # add your channel ID
+LOGS_CHANNEL_ID = 0 # add your channel ID
 TIMEZONE = pytz.timezone("America/Chicago")
-START_TIME = TIMEZONE.localize(datetime.datetime(2025, 4, 23, 8, 30))
+START_TIME = TIMEZONE.localize(datetime.datetime(0, 0, 0, 0, 0)) # add start time (year, month, day, hour minute)
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -233,25 +235,28 @@ def execute_trade(signal, price, confidence):
     acct = load_account()
     cash = acct['cash']
     shares = acct['shares']
-    action, executed_shares, reason = None, 0.0, ""
+    pending_settlement = 0.0
+    if os.path.exists(SETTLEMENT_FILE):
+        df_set = pd.read_csv(SETTLEMENT_FILE, parse_dates=["date"])
+        pending_settlement = df_set["amount"].sum()
+    account_value = cash + shares * price + pending_settlement
 
+    action, executed_shares, reason = None, 0.0, ""
     if signal == 1 and (cash - 5) > 0:
         executed_shares = round((cash - 5) / price, 4)
         if executed_shares > 0:
             cash -= executed_shares * price
             shares += executed_shares
             action = "BUY"
-            reason = f"Model predicted price increase in the next 3 hours with {confidence:.2%} confidence."
-        if executed_shares < 0.0001:
-            return None, 0, price, (cash-5) + shares * price, "Not enough cash to buy meaningful shares."
-
+            reason = f"Model predicted price increase next 3h with {confidence:.2%} confidence."
     elif signal == 0 and shares > 0:
         executed_shares = shares
         proceeds = shares * price
         log_settlement(proceeds)
+        cash = cash
         shares = 0
         action = "SELL"
-        reason = f"Model predicted price drop in the next 3 hours with {confidence:.2%} confidence."
+        reason = f"Model predicted price drop next 3h with {confidence:.2%} confidence."
 
     if action:
         save_account(cash, shares)
@@ -262,14 +267,11 @@ def execute_trade(signal, price, confidence):
             "shares": executed_shares,
             "reason": reason
         }]).to_csv(TRADE_LOG, mode='a', header=False, index=False)
-        pending_settlement = 0.0
-        if os.path.exists(SETTLEMENT_FILE):
-            df = pd.read_csv(SETTLEMENT_FILE, parse_dates=["date"])
-            pending_settlement = df["amount"].sum()
-
         account_value = cash + shares * price + pending_settlement
+
         return action, executed_shares, price, account_value, reason
-    return None, 0, price, account_value, "Model did not predict a buy signal or sell opportunity."
+
+    return None, 0, price, account_value, "No trade action taken."
 
 @tasks.loop(time=datetime.time(hour=8, minute=0, tzinfo=TIMEZONE))
 async def check_settlement():
@@ -305,18 +307,23 @@ def log_settlement(amount):
     now = datetime.datetime.now(TIMEZONE)
     new_entry = pd.DataFrame([{"date": now, "amount": amount}])
 
+    df = pd.DataFrame(columns=["date", "amount"])
     if os.path.exists(SETTLEMENT_FILE):
         df = pd.read_csv(SETTLEMENT_FILE, parse_dates=["date"])
-        df = df.dropna(how='all')
-        df = df.loc[:, df.columns.intersection(["date", "amount"])]
-    else:
-        df = pd.DataFrame(columns=["date", "amount"])
+        df = df[["date", "amount"]].dropna(subset=["date", "amount"], how="any")
 
-    df = pd.concat([df, new_entry], ignore_index=True)
+    if df.empty or df.isna().all().all():
+        df = new_entry
+    else:
+        df = pd.concat([df, new_entry], ignore_index=True)
+
     df.to_csv(SETTLEMENT_FILE, index=False)
 
 @bot.command()
 async def account(ctx):
+    """
+    Show available cash, pending settlement, share count, and total account value.
+    """
     acct = load_account()
     last_price = yf.Ticker(TICKER).history(period="1d")['Close'].iloc[-1]
     pending_settlement = 0.0
@@ -341,6 +348,9 @@ async def account(ctx):
 
 @bot.command()
 async def trade(ctx):
+    """
+    Fetch latest indicators, run ML model, and execute buy/sell if signal threshold met.
+    """
     try:
         embed_checking = discord.Embed(
             title="🔍 Trade Check",
@@ -388,6 +398,9 @@ async def trade(ctx):
 
 @bot.command()
 async def graph(ctx):
+    """
+    Plot and send the equity curve (account value) over time as a PNG.
+    """
     acct = load_account()
     trades = pd.read_csv(TRADE_LOG)
     
@@ -435,45 +448,45 @@ async def graph(ctx):
 
 @bot.command()
 async def strat(ctx):
+    """
+    Describe how the bot trains, when it trades, and which indicators it uses.
+    """
     embed = discord.Embed(
         title="📊 Trading Strategy Overview",
         description=(
-            f"This bot uses a **Gradient Boosting Classifier** to trade **{TICKER}** during U.S. market hours."
+            "This bot retrains a Gradient Boosting model every day at 3:00 PM CST on the last 2 years of hourly NVDA data, "
+            "using a binary target: price up >0.3% over the next 3 hours.\n"
+            "During market hours (M–F, 8:30 AM–3:00 PM CST), it checks hourly signals and executes full-position buys or full-position sells."
         ),
         color=0x8e44ad
     )
-
     embed.add_field(
-        name="✅ Trading Rules",
-        value=(
-            "- Runs only on weekdays (Mon-Fri)\n"
-            "- Avoids U.S. market holidays (`holidays.json`)\n"
-            "- Trades between 8:30 AM and 3:00 PM CST"
-        ),
+        name="🔄 Daily Retrain",
+        value="- At 3 PM CST, fetch last 2 yrs hourly data\n"
+              "- Compute indicators & label 3-hr future returns\n"
+              "- Fit GradientBoostingClassifier\n"
+              "- Save model & feature list",
         inline=False
     )
-
     embed.add_field(
-        name="📈 Strategy Details",
-        value=(
-            "- Uses last 15 days of hourly data\n"
-            "- Indicators: SMA Ratio, RSI, ATR, OBV, Bollinger Band Width, Stochastic K/D, Donchian Midpoint & Width\n"
-            f"- Predicts if **{TICKER}** will rise >0.3% in next 3 hours\n"
-            "- Confidence threshold: >60%\n"
-            "- Buys with all cash, sells entire position\n"
-            "- Trades fractional shares, settles next day"
-        ),
+        name="⏱️ Trading Logic",
+        value="- Hourly: predict probability of price rise >0.3%\n"
+              "- Buy if p>60% with all available cash\n"
+              "- Sell entire position if p≤60%\n"
+              "- Settle sales next morning",
         inline=False
     )
-
+    embed.add_field(
+        name="📈 Indicators",
+        value="SMA Ratio, RSI, ATR, OBV, Bollinger Width, Stochastic K/D, Donchian Mid & Width",
+        inline=False
+    )
     embed.add_field(
         name="📌 Commands",
-        value="`!account` - View account\n`!graph` - View portfolio graph\n`!trade` - Run trading cycle",
+        value="`!account`, `!trade`, `!graph`, `!memory`, `!strat`",
         inline=False
     )
-
     embed.timestamp = ctx.message.created_at
-
     await ctx.send(embed=embed)
 
 @tasks.loop(minutes=1)
@@ -489,7 +502,7 @@ async def scheduled_trade():
     if now.date() in holidays:
         embed_holiday = discord.Embed(
             title="⛔ Market Closed",
-            description=f"No trading today – **{now.strftime('%A, %B %d, %Y')}** is a market holiday.",
+            description=f"No trading today - **{now.strftime('%A, %B %d, %Y')}** is a market holiday.",
             color=0xe74c3c
         )
         embed_holiday.timestamp = now
@@ -517,7 +530,7 @@ async def run_trade(channel):
     df = fetch_data()
     model, features = await load_model()
     signal, confidence = generate_signal(model, df.iloc[-1], features)
-    price = df.iloc[-1]['Close']
+    price = yf.Ticker(TICKER).fast_info['last_price']
     action, shares, price, value, reason = execute_trade(signal, price, confidence)
 
     now = datetime.datetime.now(TIMEZONE)
@@ -546,6 +559,9 @@ async def run_trade(channel):
 
 @bot.command()
 async def test(ctx):
+    """
+    Compare last model prediction against historical indicator stats.
+    """
     try:
         df = pd.read_csv(DATASET_FILE)
 
@@ -621,6 +637,9 @@ async def test(ctx):
 
 @bot.command()
 async def why(ctx):
+    """
+    Generate SHAP breakdown explaining last model prediction.
+    """
     try:
         model, features = await load_model()
         df = pd.read_csv(DATASET_FILE)
@@ -683,6 +702,78 @@ async def why(ctx):
             color=0xff0000
         )
         await ctx.send(embed=error_embed)
+
+@bot.command()
+async def profit(ctx):
+    """
+    Show current profit/loss relative to the starting balance, $100.
+    """
+    acct = load_account()
+    last_price = yf.Ticker(TICKER).history(period="1d")['Close'].iloc[-1]
+
+    pending_settlement = 0.0
+    if os.path.exists(SETTLEMENT_FILE):
+        df = pd.read_csv(SETTLEMENT_FILE, parse_dates=["date"])
+        pending_settlement = df["amount"].sum()
+
+    total_value = acct['cash'] + acct['shares'] * last_price + pending_settlement
+
+    embed = discord.Embed(
+        title="💰 Profit/Loss",
+        color=0x6b1a7d
+    )
+    if (total_value-100 > 0):
+        embed.add_field(
+            name="📈 Profit",
+            value=f"Currently up ${total_value-100}",
+            inline=False
+        )
+    elif (total_value-100 < 0):
+        embed.add_field(
+            name="📉 Loss",
+            value=f"Currently down ${total_value-100}",
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="📊 Break-even",
+            value=f"Currently at ${total_value-100}",
+            inline=False
+        )
+    embed.timestamp = ctx.message.created_at
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def system(ctx):
+    """
+    Report CPU, memory, disk, load average, process count, network I/O and uptime.
+    """
+    proc = psutil.Process(os.getpid())
+    mem = proc.memory_info()
+    current_rss = mem.rss / 1024**2
+    peak_rss    = getattr(mem, 'peak_wset', mem.rss) / 1024**2
+    cpu = proc.cpu_percent(interval=0.1)
+    load1, load5, load15 = psutil.getloadavg()
+    threads = proc.num_threads()
+    total_procs = len(psutil.pids())
+    du = shutil.disk_usage("/")
+    disk_used = (du.used / du.total) * 100
+    net = psutil.net_io_counters()
+    sent_mb = net.bytes_sent / 1024**2
+    recv_mb = net.bytes_recv / 1024**2
+    uptime = datetime.datetime.now(TIMEZONE) - datetime.datetime.fromtimestamp(proc.create_time(), TIMEZONE)
+
+    embed = discord.Embed(title="🖥️ System Usage", color=0x95a5a6)
+    embed.add_field(name="CPU Usage",      value=f"{cpu:.1f} %", inline=True)
+    embed.add_field(name="Load Avg (1/5/15m)", value=f"{load1:.2f}/{load5:.2f}/{load15:.2f}", inline=True)
+    embed.add_field(name="Current RSS",    value=f"{current_rss:.1f} MB", inline=True)
+    embed.add_field(name="Peak RSS",       value=f"{peak_rss:.1f} MB", inline=True)
+    embed.add_field(name="Threads",        value=str(threads), inline=True)
+    embed.add_field(name="Processes",      value=str(total_procs), inline=True)
+    embed.add_field(name="Disk Used",      value=f"{disk_used:.1f} %", inline=True)
+    embed.add_field(name="Net Sent/Recv",  value=f"{sent_mb:.1f} MB / {recv_mb:.1f} MB", inline=False)
+    embed.add_field(name="Uptime",         value=str(uptime).split('.')[0], inline=False)
+    await ctx.send(embed=embed)
 
 @bot.event
 async def on_ready():
